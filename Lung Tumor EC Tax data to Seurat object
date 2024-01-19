@@ -1,0 +1,16 @@
+## load Matrix libraries
+library(Matrix)
+library(Seurat)
+
+## Read Expression Data as full matrix
+online_data = read.table("Data.csv", sep=",", header=T, row.names = 1)
+
+## read metadata
+## NOTE! Check separator from the metadata file! Otherwise error in `[.data.frame`(meta.data, , ii, drop = FALSE) (usually , or ;)
+online_metadata = read.table("Metadata.csv", sep=",", header=T, row.names=1)
+
+## Convert to sparse matrix
+matrix_data = as(as.matrix(online_data), "sparseMatrix")
+
+## Create Seurat object using sparse.mat and meta objects created above
+seurat_object = CreateSeuratObject(matrix_data, assay = "RNA", min.cells = 5, min.features = 500, meta.data = online_metadata)
