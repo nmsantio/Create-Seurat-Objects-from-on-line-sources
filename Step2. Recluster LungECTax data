@@ -1,0 +1,306 @@
+# libraries
+library(Seurat)
+library(dplyr)
+library(RColorBrewer) 
+library(heatmaply) 
+library(ggplot2)
+library(SeuratObject)
+library(patchwork)
+
+
+#################################################################################
+# READ DATA FROM LUNG EX TAX
+#################################################################################
+
+# reference https://pubmed.ncbi.nlm.nih.gov/31935371/
+# Mouse lung from https://endotheliomics.shinyapps.io/lung_ectax/
+
+## load Matrix libraries
+library(Matrix)
+library(Seurat)
+
+## Read Expression Data as full matrix (Mouse Tumor EC data)
+online_data = read.table("Data.csv", sep=",", header=T, row.names = 1)
+
+## read metadata (Mouse Tumor EC data)
+## NOTE! Check separator from the metadata file! Otherwise error in `[.data.frame`(meta.data, , ii, drop = FALSE) (usually , or ;)
+online_metadata = read.table("Metadata.csv", sep=",", header=T, row.names=1)
+
+## Convert to sparse matrix
+matrix_data = as(as.matrix(online_data), "sparseMatrix")
+
+## Create Seurat object using sparse.mat and meta objects created above
+seurat_object = CreateSeuratObject(matrix_data, assay = "RNA", min.cells = 3, min.features = 300, meta.data = online_metadata)
+
+View(seurat_object@meta.data)
+
+# add mt and rb percentages (mt is normalized out of the EC Atlas data, thereby results in 0%)
+seurat_object = PercentageFeatureSet(seurat_object, pattern = "^mt-", col.name = "percent.mt")
+seurat_object = PercentageFeatureSet(seurat_object, pattern = "^Rp[sl]", col.name = "percent.rb")
+
+saveRDS(seurat_object, file = "rawdata.rds")
+
+# visualize 
+tiff("vlnplot_unfiltered.tiff", units="in", width=10, height=7, res=300)
+VlnPlot(seurat_object, features = c("nFeature_RNA", "nCount_RNA", "percent.mt", "percent.rb"), ncol = 4) 
+dev.off()
+
+# Get row names of the matrix
+row_names = rownames(rawdata)
+write.table(row_names , "row_names.txt", sep="\t", row.names=TRUE, col.names=TRUE, quote= F) 
+
+#filter
+seurat_filtered = subset(rawdata, subset = nFeature_RNA > 1000 & nFeature_RNA < 5000)
+saveRDS(seurat_filtered, file = "filtereddata.rds")
+
+# visualize 
+tiff("vlnplot_filtered.tiff", units="in", width=10, height=7, res=300)
+VlnPlot(seurat_filtered, features = c("nFeature_RNA", "nCount_RNA", "percent.mt", "percent.rb"), ncol = 4) 
+dev.off()
+
+View(seurat_filtered@meta.data)
+
+table(seurat_filtered@meta.data$Experiment)
+#Experiment 1 Experiment 2 Experiment 3 
+#12421         9233         7004 
+
+table(seurat_filtered@meta.data$Condition)
+#API242_subcutanous.exp1                   DC101                     NEC                     PTK                     TEC 
+#1227                                       7673                    4513                    6125                    9120 
+
+table(seurat_filtered@meta.data$Endothelial.cell)
+#No   Yes 
+#5456 23202 
+
+# subset EC
+EndothelialCells = subset(seurat_filtered, Endothelial.cell %in% c("Yes"))
+table(EndothelialCells@meta.data$orig.ident)
+
+#ortho 
+#23202 
+
+# subsetNEC and TEC
+NECTEC = subset(EndothelialCells, Condition %in% c("NEC", "TEC"))
+table(NECTEC@meta.data$Condition)
+#NEC  TEC 
+#1409 8004 
+
+View(NECTEC@meta.data)
+
+# get the values
+rdata = GetAssayData(object = NECTEC, assay = "RNA", layer = "counts")
+rdata = CreateSeuratObject(counts = rdata)
+
+# keep information from metadatatable
+temp = NECTEC@meta.data
+all(colnames(rdata) == row.names(temp)) # [1] TRUE
+
+# select the data
+rdata = AddMetaData(rdata, temp$percent.mt, col.name = "percent.mt")
+rdata = AddMetaData(rdata, temp$percent.rb, col.name = "percent.rb")
+rdata = AddMetaData(rdata, temp$Experiment, col.name = "Experiment")
+rdata = AddMetaData(rdata, temp$Condition, col.name = "Condition")
+rdata = AddMetaData(rdata, temp$Cluster, col.name = "OldAnnot")
+
+# subset to rename
+NEC = subset(rdata, Condition %in% c("NEC"))
+NEC$sampleID = "NEC1" 
+NEC$treatment = "NEC_ECTax"
+
+TEC = subset(rdata, Condition %in% c("TEC"))
+TEC$treatment = "TEC_ECTax"
+
+library(tidyverse)
+temp = TEC@meta.data
+temp = temp %>%
+  mutate(sampleID = case_when(Experiment %in%  c("Experiment 1") ~ "TEC1",
+                              Experiment %in%  c("Experiment 2") ~ "TEC2",
+                              Experiment %in%  c("Experiment 3") ~ "TEC3"))
+all(row.names(temp) == colnames(TEC)) #TRUE
+TEC = AddMetaData(TEC, metadata = temp$sampleID, col.name = "sampleID")
+table(TEC@meta.data$sampleID)
+
+merged =  merge(NEC,TEC)
+
+#confirm eveything is correct
+table(merged@meta.data$Experiment, merged@meta.data$Condition)
+#NEC  TEC
+#Experiment 1 1409 3493
+#Experiment 2    0 2156
+#Experiment 3    0 2355
+
+View(merged@meta.data)
+
+table(merged@meta.data$sampleID)
+#NEC1 TEC1 TEC2 TEC3 
+#1409 3493 2156 2355 
+
+#SCT and PCA
+merged[["RNA"]] = JoinLayers(merged[["RNA"]])
+merged[["RNA"]] = split(merged[["RNA"]], f = merged$sampleID)
+options(future.globals.maxSize = 3e+09)
+Sobj5 = SCTransform(merged)
+Sobj5 = RunPCA(Sobj5, npcs = 50, verbose = F)
+
+#check plot for PCs
+pdf("med.elbowplots_S5.pdf")
+ElbowPlot(Sobj5, ndims = 50)
+dev.off()
+
+#save
+saveRDS(Sobj5, file = "Sobj5_forintegration.rds")
+
+#integrate
+integrateddata = IntegrateLayers(object = Sobj5,  method = RPCAIntegration,  normalization.method = "SCT",  verbose = T)
+clustereddata = FindNeighbors(integrateddata, reduction = "integrated.dr", dims = 1:30)
+clustered = FindClusters(clustereddata, resolution = 0.8)
+UMAP = RunUMAP(clustered, reduction = "integrated.dr", dims = 1:30)
+saveRDS(UMAP, file = "UMAP_S5_res08.rds")
+
+# Visualization
+DefaultAssay(UMAP) = "SCT"
+UMAPPlot(UMAP, label = T, split.by = "treatment", pt.size = 0.1)
+DotPlot(UMAP, features = (markers)) + RotatedAxis() + scale_colour_gradient2(low = "#0000FF", mid = "#FFFFFF", high = "#FF0000")
+VlnPlot(UMAP, features = c("nFeature_RNA", "nCount_RNA", "percent.rb"), ncol = 4, pt.size = 0) 
+ 
+markers = c("Plat", "Gja5", "Bmx",        # artery
+            "Gpihbp1", "Sema3c","Kit",    # gCap
+            "Isg15", "Ifit3b", "Ifit1",   # hIFN 
+            "Car4", "Apln", "Ednrb",      # aCap
+            "Prox1", "Pdpn", "Mmrn1",     # LEC
+            "Slc6a2", "Amigo2", "Vwf",    # vein
+            "Inhba",  "Crip1", "Actn1",   # large vein
+            "Fabp4", "Cd300lg", "Mgll",   # tumor cap = tCap
+            "Gja4", "Sat1", "Enpp2",      # activated artery = ActArtery
+            "Glul", "Cxcl12", "Sparcl1",  # neophalanx
+            "Hmgb2", "H2afz", "Stmn1",    # proliferating
+            "Pdlim1", "Rplp0", "Rpsa",    # immature 
+            "Rbp1", "Fscn1", "Trp53i11",  # tip
+            "Mcam", "Pxdn", "Flna",       # breach
+            "Ackr1", "Lrg1", "Selp")      # PCV
+
+#rename
+names_res08 = RenameIdents((UMAP),
+                           `13` = "Artery", 
+                           `6` = "gCap", 
+                           `10` = "hIFN",   
+                           `7` = "aCap",
+                           `14` = "aCap",
+                           `12` = "LEC",
+                           `11` = "Vein",
+                           `15` = "LVein",
+                           `5` = "tCap", 
+                           `4` = "actArtery",
+                           `8` = "neoph",
+                           `9` = "prolif", 
+                           `0` = "Immature",
+                           `2` = "tip",     
+                           `1` = "breach",
+                           `3` = "PCV") 
+
+#print cell numbers per cluster
+cluster_cellnro = table(Idents(names_res06), names_res06$sampleID)
+write.table(cluster_cellnro , "cellnro_sampleID_res06.txt", sep="\t", row.names=TRUE, col.names=TRUE, quote= F) 
+
+#save
+saveRDS(names_res08, file = "names_res08.rds")
+
+#find markers
+DefaultAssay(names_res08) = "SCT"
+ClusterMarkersPrep = PrepSCTFindMarkers(names_res08, assay = "SCT", verbose = TRUE)
+ClusterMarkers = FindAllMarkers(ClusterMarkersPrep, assay = "SCT", only.pos = TRUE, min.pct = 0.1, logfc.threshold = 0.1)
+write.table(ClusterMarkers, "ClusterMarkerspct01fc01.txt", sep="\t", row.names=TRUE, col.names=TRUE, quote= F)
+
+# Visualization
+tiff("Clusters_manuscript.tiff", units="in", width=8, height=5, res=500)
+UMAPPlot(names_res08, label = F,  pt.size = 0.1, 
+         cols = c('Artery'='#F8766D','gCap'='#00C094','hIFN'='#c49a00',
+                  'aCap'='#53B400', 'LEC'='#A58AFF','Vein'='#FB61D7', 'PCV'='#00b4eb','aCap'='#53B400', 
+                  'LVein'='#ab358f', 'tCap'='#49f5e7','actArtery'='#A53E37', 'neoph'='#a3e8f7', 'Immature'='#DBDEDF','prolif'='#4c82a1','tip'='#023531','breach'='#02655D'))
+dev.off()
+
+DefaultAssay(names_res08) = "SCT"
+tiff("Markers_NAMES2.tiff", units="in", width=13, height=5, res=300)
+DotPlot(names_res08, features = (markers)) + RotatedAxis() + 
+  scale_colour_gradient2(low = "#0000FF", mid = "#FFFFFF", high = "#FF0000")
+dev.off()
+
+# Visualization
+tiff("Clusters_NEC_TEC.tiff", units="in", width=8, height=6, res=400)
+UMAPPlot(names_res08, label = F, pt.size = 0.2, group.by = "Condition",
+         cols = c('TEC'='#1678e1','NEC'='#f2a5ce'))
+dev.off()
+
+#subset only TEC specific clusters
+TEC = subset(names_res08, Condition %in% c("TEC"))
+TECspecific = subset(TEC, idents = c("hIFN", "PCV", "LVein", "tCap", "actArtery", "neoph", "Immature", "prolif", "tip", "breach"))
+
+
+#-----------------gene set projection------------------------------------
+
+# projection
+library(UCell)
+library(nichenetr)
+
+#custom plots
+library(viridis)
+library(scCustomize)
+
+#statistics
+library(rstatix)
+
+crECmarkers = c("Tmem252", "Atp8b1", "Litaf", "Cdc42ep4", "Adamts9", "Bcl3", "Grrp1", "Spry4", "Osmr", "Mlec",
+                "Scarb1", "Inhbb", "Pim3", "Sbno2", "Ntn1", "Gadd45g", "Ackr3",  "Il4ra", "Mcam", "Disp2", "Kazn", "Pfkfb3",
+                "Emp1", "Bhlhe40", "Syt15", "Xbp1", "Tgm2", "Tmem173", "March3", "Synpo", "Pdlim1", "Lima1", "Cmah", "St3gal1", 
+                "Kit", "Gm14221", "Samsn1", "Susd6", "Cebpd", "Tnfrsf1a", "Myc", "Lalba", "Top1", 
+                "Slc3a2", "Galnt18", "Ifitm3", "Col4a1", "Ly6a", "Apobec3", "Csrp2")
+
+PCVmarkers = c("Ackr1","Lrg1","Selp","2200002D01Rik","Spint2","Csrp2","Tmem252","Aqp1",
+               "Eef1b2","Rps3","Socs3","Adamts9","Serpinb1a","Ubd","Gda","Mmrn2","Fjx1",
+               "Nfkbia","Grrp1","Vamp5","Ehd3","Btbd3","Ogfrl1","Tgfbi","Ifitm2","Slco3a1",
+               "Sncg","Ctla2a","Fosl2","Serpinb9","Csf2rb2","Hif1a","Emp1","Ctsb","Zfp36",
+               "Slco2b1","Csf2rb","Ifitm3","Crim1","Tagln","Prcp","Syngr2","Rcan1","Entpd1",
+               "Nfkbiz","Cd14","Dnm3","Sh3bp5","Jak1","Cox7a2l")
+
+TECcapillary = c("Fabp4", "Cd36", "Cd300lg", "Lpl", "Gpihbp1", "Fabp5", "Hspb1", "Mgll", "Sgk1", "Tcf15", 
+                 "Scarb1", "Pim3", "Timp4", "Thrsp", "Aqp7", "Sult1a1", "Kcna5", "Scgb3a1", "Ablim3", "Adgrg1",
+                 "Ccdc85a", "Lnx1", "Pdzd2", "Hrct1", "Lipe", "Pparg", "Arid5b", "Unc45b", "Mylip", "Slc26a10",
+                 "Slc28a2", "Ifngr1", "Tpst1", "Hp", "Gm12002", "Plcb4", "Neu1", "Rgs5", "Eepd1", "Gopc", "Fam89a", 
+                 "Car3", "Cyth1", "Itpripl1", "Cfd", "Nepn", "Etl4", "Gpr160", "Jam3", "Papss2")
+
+Breachmarkers = c("Hspg2", "Col4a2", "Col4a1", "Igfbp3", "Lamb1", "Col18a1", "Mcam", "Pxdn", "Cd93", "Flna", "Nid2", "Lama4", "Col15a1",
+                  "Lamc1", "Plxnd1", "Angpt2", "Vwa1", "Pkm", "Robo4", "Itgb1", "Itgb3", "Notch4", "Esm1", "Flnb", "Nid1", "Pde2a", "Itga5", 
+                  "Tcf4", "Vcp", "Lrp10", "Gja1", "Myh9", "Thbs1", "Itga6", "Tie1", "Dll4", "Dync1h1", "Kit", "Adamts7", "Mmp14", "Calu", "Nes",
+                  "Fkbp10", "Ddb1", "Pald1", "Slc38a2", "Pdgfb", "Inhbb", "Tln1", "Sipa1")
+
+#replace name with the correct gene list
+signatures = list(YourMarkers = crECmarkers)
+
+# perform gene set projection to a selected data
+UCellcrECm= AddModuleScore_UCell(names_res08, features = signatures)
+
+#color palette
+pal = viridis(n = 10, alpha = 1, begin = 0, end = 1, direction = 1, option = "H") #turbo
+
+#visualize
+tiff("CustomPlot_crECmarkers_TEC.tiff", units="in", width=4, height=3, res=500)
+FeaturePlot_scCustom(UCellcrECm, features = "YourMarkers_UCell", label = FALSE,  colors_use = pal)
+dev.off()
+
+tiff("VlnPlot_crECmarkers_TEC.tiff", units="in", width=6, height=4, res=500)
+VlnPlot(UCellcrECm, features = "YourMarkers_UCell", pt.size = 0)
+dev.off()
+
+# perform statistical analysis to the data
+p1 <- VlnPlot(UCellcrECm, features = "YourMarkers_UCell")
+
+df <- p1[[1]][["data"]]
+
+stat.test <- df %>%
+  group_by("ident") %>%
+  t_test(YourMarkers_UCell ~ ident) %>%
+  adjust_pvalue(method = "bonferroni") %>%
+  add_significance()
+stat.test
+write.table(stat.test , "stat_crECmarkers_TEC.txt", sep="\t", row.names=TRUE, col.names=TRUE, quote= F) 
+
